@@ -1,0 +1,25 @@
+# 后端服务引擎
+Flask>=2.0.0
+gunicorn>=21.2.0
+
+# 核心分词与 NLP 逻辑
+jieba>=0.42.1
+
+# 数据处理与无监督聚类
+scikit-learn>=1.0.2
+numpy>=1.26.0
+
+# 词云图生成
+wordcloud>=1.9.3
+
+# 图形辅助绘制模块
+matplotlib>=3.5.0
+
+# 底层图像处理
+Pillow>=9.0.0
+
+# PDF 文本提取
+PyMuPDF>=1.23.8
+
+# LLM API 调用
+openai>=1.12.0
