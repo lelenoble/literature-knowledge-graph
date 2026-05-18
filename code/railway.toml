@@ -1,3 +1,0 @@
-[deploy]
-numReplicas = 1
-healthcheckPath = "/api/papers/list"
