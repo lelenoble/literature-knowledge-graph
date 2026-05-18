@@ -18,7 +18,7 @@ import numpy as np
 from flask import Flask, render_template, request, jsonify
 import jieba
 import jieba.analyse
-import jieba.posseg as pseg
+
 from wordcloud import WordCloud
 import matplotlib
 matplotlib.use('Agg')
@@ -31,6 +31,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from storage.paper_store import PaperStore
 from models.relation import Relation, RelationType, RELATION_LABELS, RELATION_COLORS
 from services.pdf_parser import parse_pdf
+from services.nlp_service import segment_text
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
@@ -110,7 +111,7 @@ def get_chinese_font():
         for p in paths:
             if os.path.exists(p):
                 return p
-    import wordcloud.wordcloud
+    import wordcloud.wordcloud # pyright: ignore[reportMissingImports]
     return wordcloud.wordcloud.FONT_PATH
 
 
@@ -120,7 +121,7 @@ def _call_llm(messages: list[dict], expect_json: bool = False) -> dict | None:
     if not cfg["api_key"]:
         return None
     try:
-        from openai import OpenAI
+        from openai import OpenAI # pyright: ignore[reportMissingImports]
         client = OpenAI(api_key=cfg["api_key"], base_url=cfg["base_url"], timeout=15.0)
         kwargs = dict(model=cfg["model"], messages=messages, temperature=0.3)
         resp = client.chat.completions.create(**kwargs)
@@ -1019,27 +1020,17 @@ def analyze():
         # 不调用 jieba.add_word，避免多用户环境下的全局副作用
         color_scheme = request.form.get('color_scheme', '科技感')
 
+        # NLP 只处理前 80K 字符，大幅加速分析
+        nlp_content = content[:80000]
+
         # 2. 分词与词性过滤（带降级策略）
-        allowed_pos = {'n', 'a', 'nr', 'ns', 'nt', 'nz'}
-        words = []
-        for item in pseg.lcut(content):
-            if len(item.word) > 1 and item.word not in custom_stopwords and item.flag in allowed_pos:
-                words.append(item.word)
-
-        # 如果 POS 过滤后词语太少，放宽限制
-        if len(words) < 10:
-            words = []
-            for item in pseg.lcut(content):
-                if len(item.word) > 1 and item.word not in custom_stopwords:
-                    words.append(item.word)
-
-        processed_text = " ".join(words)
+        words, processed_text = segment_text(nlp_content, custom_stopwords, use_pos=True)
 
         if not processed_text.strip():
             return jsonify({'error': '有效文本不足（可能全是停用词）'}), 400
 
         # 3. TF-IDF 分析
-        tfidf_results_all = jieba.analyse.extract_tags(processed_text, topK=5000, withWeight=True)
+        tfidf_results_all = jieba.analyse.extract_tags(processed_text, topK=500, withWeight=True)
         tfidf_dict = dict(tfidf_results_all)
 
         tfidf_results = tfidf_results_all[:50]
@@ -1099,7 +1090,7 @@ def analyze():
         top_8_pie = [{"name": item[0], "value": round(item[1], 4)} for item in tfidf_results[:8]]
 
         # 7. 共现网络分析
-        sentences = re.split(r'[。！？.!?\n]+', content)
+        sentences = re.split(r'[。！？.!?\n]+', nlp_content)
         # 过滤掉常见的无效单字和无意义词
         _noise_words = {'研究', '基于', '本文', '提出', '使用', '进行', '一种', '方法', '分析', '问题',
                         '可以', '不同', '实验', '结果', '表明', '数据', '模型', '通过', '采用', '实现',

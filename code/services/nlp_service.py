@@ -11,23 +11,25 @@ def segment_text(
     content: str,
     custom_stopwords: set[str] | None = None,
     allowed_pos: set[str] | None = None,
+    use_pos: bool = False,
 ) -> tuple[list[str], str]:
     if custom_stopwords is None:
         custom_stopwords = set()
     if allowed_pos is None:
         allowed_pos = {"n", "a", "nr", "ns", "nt", "nz"}
 
-    words = []
-    for item in pseg.lcut(content):
-        if len(item.word) > 1 and item.word not in custom_stopwords and item.flag in allowed_pos:
-            words.append(item.word)
-
-    # 如果 POS 过滤后词语太少（如英文论文或特殊文本），放宽限制
-    if len(words) < 10:
+    if use_pos:
         words = []
         for item in pseg.lcut(content):
-            if len(item.word) > 1 and item.word not in custom_stopwords:
+            if len(item.word) > 1 and item.word not in custom_stopwords and item.flag in allowed_pos:
                 words.append(item.word)
+        if len(words) < 10:
+            words = []
+            for item in pseg.lcut(content):
+                if len(item.word) > 1 and item.word not in custom_stopwords:
+                    words.append(item.word)
+    else:
+        words = [w for w in jieba.lcut(content) if len(w) > 1 and w not in custom_stopwords]
 
     processed_text = " ".join(words)
     return words, processed_text
