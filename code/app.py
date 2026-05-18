@@ -33,10 +33,43 @@ from models.relation import Relation, RelationType, RELATION_LABELS, RELATION_CO
 from services.pdf_parser import parse_pdf
 
 app = Flask(__name__)
-store = PaperStore()
+app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
 
+_stores: dict[str, PaperStore] = {}
+_stores_lock = threading.Lock()
 _tasks: dict[str, dict] = {}
-_task_lock = threading.Lock()
+_tasks_lock = threading.Lock()
+_cluster_meta_by_session: dict[str, dict] = {}
+
+
+def _session_id() -> str:
+    from flask import session
+    if "uid" not in session:
+        session["uid"] = os.urandom(16).hex()
+    return session["uid"]
+
+
+def _get_store() -> PaperStore:
+    sid = _session_id()
+    with _stores_lock:
+        if sid not in _stores:
+            _stores[sid] = PaperStore()
+        return _stores[sid]
+
+
+def _get_tasks() -> dict:
+    sid = _session_id()
+    with _tasks_lock:
+        if sid not in _tasks:
+            _tasks[sid] = {}
+        return _tasks[sid]
+
+
+def _get_cluster_meta() -> dict:
+    sid = _session_id()
+    if sid not in _cluster_meta_by_session:
+        _cluster_meta_by_session[sid] = {}
+    return _cluster_meta_by_session[sid]
 
 # ---------------- LLM 配置 ----------------
 _llm_config: dict = {
@@ -96,7 +129,7 @@ def _call_llm(messages: list[dict], expect_json: bool = False) -> dict | None:
 
 def _build_heuristic_relations() -> list[dict]:
     """纯启发式论文关系检测（不依赖 LLM，作为降级方案）"""
-    papers = store.list_all()
+    papers = _get_store().list_all()
     if len(papers) < 2:
         return []
 
@@ -193,17 +226,17 @@ def upload_papers():
         raw_bytes = file.read()
         result = parse_pdf(raw_bytes, file.filename)
         if result.get("success"):
-            paper_id = store.add(result)
+            paper_id = _get_store().add(result)
             results.append({"id": paper_id, "title": result["title"], "status": "success"})
         else:
             results.append({"filename": file.filename, "status": "error", "error": result.get("error", "未知错误")})
 
-    return jsonify({"papers": results, "total": store.paper_count})
+    return jsonify({"papers": results, "total": _get_store().paper_count})
 
 
 @app.route('/api/papers/list', methods=['GET'])
 def list_papers():
-    papers = store.list_all()
+    papers = _get_store().list_all()
     return jsonify({
         "papers": [
             {
@@ -222,7 +255,7 @@ def list_papers():
 
 @app.route('/api/papers/<paper_id>', methods=['GET'])
 def get_paper(paper_id):
-    paper = store.get(paper_id)
+    paper = _get_store().get(paper_id)
     if not paper:
         return jsonify({'error': '论文不存在'}), 404
     return jsonify({"paper": paper})
@@ -230,7 +263,7 @@ def get_paper(paper_id):
 
 @app.route('/api/papers/clear', methods=['DELETE'])
 def clear_papers():
-    store.clear()
+    _get_store().clear()
     return jsonify({"success": True, "total": 0})
 
 
@@ -252,19 +285,19 @@ def configure_llm():
 
 @app.route('/api/graph/build', methods=['POST'])
 def build_graph():
-    if store.paper_count < 2:
+    if _get_store().paper_count < 2:
         return jsonify({'error': '至少需要 2 篇论文才能构建图谱'}), 400
 
     task_id = f"graph_{int(time.time())}"
-    with _task_lock:
-        _tasks[task_id] = {"status": "running", "progress": 0, "result": None}
+    with _tasks_lock:
+        _get_tasks()[task_id] = {"status": "running", "progress": 0, "result": None}
 
     def _run():
-        store.clear_relations()
+        _get_store().clear_relations()
 
         has_llm = bool(_llm_config["api_key"])
         if has_llm:
-            papers = store.list_all()
+            papers = _get_store().list_all()
             texts = [p.get("abstract", p.get("full_text", ""))[:3000] for p in papers]
 
             vectorizer = TfidfVectorizer(max_features=500)
@@ -300,7 +333,7 @@ def build_graph():
                         if kw_overlap > 0.6 and sim > 0.7:
                             source = papers[i]["id"] if (year_i or 0) <= (year_j or 0) else papers[j]["id"]
                             target = papers[j]["id"] if source == papers[i]["id"] else papers[i]["id"]
-                            store.add_relation(Relation(source_id=source, target_id=target,
+                            _get_store().add_relation(Relation(source_id=source, target_id=target,
                                                        relation_type=RelationType.SHARED_TOPIC,
                                                        confidence=round(sim, 2),
                                                        evidence=f"高摘要相似度 {sim:.2f}，关键词重叠 {kw_overlap:.2f}"))
@@ -309,7 +342,7 @@ def build_graph():
                         elif kw_overlap > 0.4:
                             source = papers[i]["id"] if (year_i or 0) <= (year_j or 0) else papers[j]["id"]
                             target = papers[j]["id"] if source == papers[i]["id"] else papers[i]["id"]
-                            store.add_relation(Relation(source_id=source, target_id=target,
+                            _get_store().add_relation(Relation(source_id=source, target_id=target,
                                                        relation_type=RelationType.SHARED_TOPIC,
                                                        confidence=round(sim, 2),
                                                        evidence=f"关键词重叠 {kw_overlap:.2f}"))
@@ -351,7 +384,7 @@ Return JSON: {{"relation": "...", "confidence": 0.0-1.0, "evidence": "reason"}}"
                                 if confidence >= 0.3:
                                     source = papers[i]["id"]
                                     target = papers[j]["id"]
-                                    store.add_relation(Relation(
+                                    _get_store().add_relation(Relation(
                                         source_id=source, target_id=target,
                                         relation_type=rel_type_enum,
                                         confidence=round(confidence, 2),
@@ -366,20 +399,20 @@ Return JSON: {{"relation": "...", "confidence": 0.0-1.0, "evidence": "reason"}}"
                             else:
                                 llm_failures = 0
 
-                        with _task_lock:
+                        with _tasks_lock:
                             progress = min(90, int((i / n) * 100))
-                            _tasks[task_id]["progress"] = progress
+                            _get_tasks()[task_id]["progress"] = progress
 
             # Fallback: 如果 LLM 分类太少，补充启发式关系
-            if classified < store.paper_count:
+            if classified < _get_store().paper_count:
                 heuristic_rels = _build_heuristic_relations()
                 for r in heuristic_rels:
                     existing = [
-                        rel for rel in store.get_relations()
+                        rel for rel in _get_store().get_relations()
                         if rel.source_id == r["source_id"] and rel.target_id == r["target_id"]
                     ]
                     if not existing:
-                        store.add_relation(Relation(
+                        _get_store().add_relation(Relation(
                             source_id=r["source_id"], target_id=r["target_id"],
                             relation_type=RelationType(r["relation_type"]),
                             confidence=r["confidence"],
@@ -388,7 +421,7 @@ Return JSON: {{"relation": "...", "confidence": 0.0-1.0, "evidence": "reason"}}"
         else:
             heuristic_rels = _build_heuristic_relations()
             for r in heuristic_rels:
-                store.add_relation(Relation(
+                _get_store().add_relation(Relation(
                     source_id=r["source_id"], target_id=r["target_id"],
                     relation_type=RelationType(r["relation_type"]),
                     confidence=r["confidence"],
@@ -402,17 +435,17 @@ Return JSON: {{"relation": "...", "confidence": 0.0-1.0, "evidence": "reason"}}"
             import traceback
             traceback.print_exc()
 
-        with _task_lock:
-            _tasks[task_id] = {"status": "done", "progress": 100, "result": {"relations": store.relation_count, "clusters": len(_cluster_meta)}}
+        with _tasks_lock:
+            _get_tasks()[task_id] = {"status": "done", "progress": 100, "result": {"relations": _get_store().relation_count, "clusters": len(_get_cluster_meta())}}
 
     thread = threading.Thread(target=_run)
     thread.daemon = True
     thread.start()
 
-    return jsonify({"task_id": task_id, "total_papers": store.paper_count})
+    return jsonify({"task_id": task_id, "total_papers": _get_store().paper_count})
 
 
-_cluster_meta: dict = {}  # cluster_id -> {label, top_keywords, centroid, ...}
+# _cluster_meta 现在通过 _get_cluster_meta() 按 session 隔离
 
 CLUSTER_COLORS = [
     '#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#8b5cf6',
@@ -452,9 +485,8 @@ def _name_clusters_via_llm(clusters_info: list[dict]) -> dict[str, str]:
 
 
 def _run_clustering():
-    """对所有论文摘要进行 KMeans 聚类，结果写入 store 和 _cluster_meta"""
-    global _cluster_meta
-    papers = store.list_all()
+    """对所有论文摘要进行 KMeans 聚类，结果写入 store 和 session-scoped cluster_meta"""
+    papers = _get_store().list_all()
     n = len(papers)
     if n < 2:
         return
@@ -521,8 +553,9 @@ def _run_clustering():
     # 调用 LLM 为聚类命名
     llm_names = _name_clusters_via_llm(list(clusters_raw.values()))
 
-    # 第二遍：构建最终的 _cluster_meta
-    _cluster_meta = {}
+    # 第二遍：构建最终的 cluster_meta
+    meta = _get_cluster_meta()
+    meta.clear()
     for c_id in range(n_clusters):
         c_key = f"cluster_{c_id}"
         raw = clusters_raw[c_key]
@@ -547,7 +580,7 @@ def _run_clustering():
         else:
             year_range = ""
 
-        _cluster_meta[c_key] = {
+        meta[c_key] = {
             "id": c_key,
             "label": label,
             "top_keywords": raw["top_keywords"],
@@ -563,12 +596,13 @@ def _run_clustering():
 @app.route('/api/graph/clusters', methods=['GET'])
 def get_clusters():
     """返回所有聚类摘要 + 相似度矩阵（气泡图数据）"""
-    if not _cluster_meta:
+    meta = _get_cluster_meta()
+    if not meta:
         return jsonify({"clusters": [], "similarity_matrix": []})
 
     clusters = []
-    for c in _cluster_meta.values():
-        cluster_papers = [store.get(pid) for pid in c["paper_ids"]]
+    for c in meta.values():
+        cluster_papers = [_get_store().get(pid) for pid in c["paper_ids"]]
         clusters.append({
             "id": c["id"],
             "label": c["label"],
@@ -584,7 +618,7 @@ def get_clusters():
         })
 
     # 聚类间相似度矩阵（基于 centroid cosine similarity）
-    cluster_ids = list(_cluster_meta.keys())
+    cluster_ids = list(meta.keys())
     n = len(cluster_ids)
     sim_matrix = []
     for i in range(n):
@@ -593,8 +627,8 @@ def get_clusters():
             if i == j:
                 row.append(1.0)
             else:
-                c_i = _cluster_meta[cluster_ids[i]]["centroid"]
-                c_j = _cluster_meta[cluster_ids[j]]["centroid"]
+                c_i = meta[cluster_ids[i]]["centroid"]
+                c_j = meta[cluster_ids[j]]["centroid"]
                 sim = cosine_similarity([c_i], [c_j])[0][0]
                 row.append(round(float(sim), 3))
         sim_matrix.append(row)
@@ -605,16 +639,17 @@ def get_clusters():
 @app.route('/api/graph/cluster/<cluster_id>', methods=['GET'])
 def get_cluster_detail(cluster_id):
     """返回单个聚类的论文列表、内部关系、关键词云"""
-    if cluster_id not in _cluster_meta:
+    meta = _get_cluster_meta()
+    if cluster_id not in meta:
         return jsonify({"error": "聚类不存在"}), 404
 
-    c = _cluster_meta[cluster_id]
-    papers_in_cluster = [store.get(pid) for pid in c["paper_ids"]]
+    c = meta[cluster_id]
+    papers_in_cluster = [_get_store().get(pid) for pid in c["paper_ids"]]
     papers_in_cluster = [p for p in papers_in_cluster if p]
     paper_ids_set = set(c["paper_ids"])
 
     # 内部关系（source 和 target 都在聚类内）
-    all_relations = store.get_relations()
+    all_relations = _get_store().get_relations()
     internal_links = []
     external_links = []
     for r in all_relations:
@@ -664,7 +699,7 @@ def get_cluster_detail(cluster_id):
 
 @app.route('/api/graph/data', methods=['GET'])
 def get_graph_data():
-    papers = store.list_all()
+    papers = _get_store().list_all()
 
     NODE_COLORS = [
         '#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#8b5cf6',
@@ -686,7 +721,7 @@ def get_graph_data():
         })
 
     links = []
-    for r in store.get_relations():
+    for r in _get_store().get_relations():
         source_node = next((n for n in nodes if n["id"] == r.source_id), None)
         target_node = next((n for n in nodes if n["id"] == r.target_id), None)
         if source_node and target_node:
@@ -713,8 +748,8 @@ def get_graph_data():
 @app.route('/api/status', methods=['GET'])
 def task_status():
     task_id = request.args.get('task_id', '')
-    with _task_lock:
-        task = _tasks.get(task_id)
+    with _tasks_lock:
+        task = _get_tasks().get(task_id)
     if not task:
         return jsonify({"status": "not_found"}), 404
     return jsonify(task)
@@ -729,7 +764,7 @@ def concept_trace():
     if not query:
         return jsonify({'error': '请输入搜索词'}), 400
 
-    papers = store.list_all()
+    papers = _get_store().list_all()
     timeline = collections.defaultdict(list)
     total_mentions = 0
 
@@ -772,7 +807,7 @@ def concept_trace():
 
 @app.route('/api/summary/paper/<paper_id>', methods=['POST'])
 def summarize_paper(paper_id):
-    paper = store.get(paper_id)
+    paper = _get_store().get(paper_id)
     if not paper:
         return jsonify({'error': '论文不存在'}), 404
 
@@ -821,7 +856,7 @@ def cross_analyze():
 
     paper_summaries = []
     for pid in paper_ids:
-        p = store.get(pid)
+        p = _get_store().get(pid)
         if p:
             paper_summaries.append(f"- {p['title']} ({p.get('year','?')}): {p.get('abstract','')[:300]}...")
 
@@ -847,7 +882,7 @@ Return JSON: {{"analysis": "overall analysis", "comparisons": [{{"dimension": "a
 
 @app.route('/api/gaps/detect', methods=['POST'])
 def detect_gaps():
-    papers = store.list_all()
+    papers = _get_store().list_all()
     discussions = []
     for p in papers:
         disc = p.get("sections", {}).get("discussion", "")
@@ -930,7 +965,7 @@ def analyze():
         # 1. 接收文件与表单数据
         paper_id = request.form.get('paper_id', '')
         if paper_id:
-            paper = store.get(paper_id)
+            paper = _get_store().get(paper_id)
             if not paper:
                 return jsonify({'error': '论文不存在'}), 404
             content = paper.get("full_text", "")
