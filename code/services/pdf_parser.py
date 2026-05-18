@@ -42,7 +42,9 @@ def parse_pdf(file_bytes: bytes, filename: str) -> dict:
     abstract = sections.get("abstract", full_text[:1500])
     discussion = sections.get("discussion", "")
 
-    words, _ = segment_text(full_text, set())
+    # NLP 处理只用前 50000 字符，大幅加速上传
+    nlp_text = full_text[:50000]
+    words, _ = segment_text(nlp_text, set())
     keywords = extract_keywords_tfidf(words, top_k=20)
 
     return {
