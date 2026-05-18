@@ -40,9 +40,15 @@ _stores_lock = threading.Lock()
 _tasks: dict[str, dict] = {}
 _tasks_lock = threading.Lock()
 _cluster_meta_by_session: dict[str, dict] = {}
+_llm_configs: dict[str, dict] = {}
+
+_bg_sid = threading.local()
 
 
 def _session_id() -> str:
+    sid = getattr(_bg_sid, 'value', None)
+    if sid:
+        return sid
     from flask import session
     if "uid" not in session:
         session["uid"] = os.urandom(16).hex()
@@ -72,11 +78,15 @@ def _get_cluster_meta() -> dict:
     return _cluster_meta_by_session[sid]
 
 # ---------------- LLM 配置 ----------------
-_llm_config: dict = {
-    "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
-    "base_url": "https://api.deepseek.com/v1",
-    "model": "deepseek-chat",
-}
+def _get_llm_config() -> dict:
+    sid = _session_id()
+    if sid not in _llm_configs:
+        _llm_configs[sid] = {
+            "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
+            "base_url": "https://api.deepseek.com/v1",
+            "model": "deepseek-chat",
+        }
+    return _llm_configs[sid]
 
 
 # ---------------- 工具函数 ----------------
@@ -106,12 +116,13 @@ def get_chinese_font():
 
 def _call_llm(messages: list[dict], expect_json: bool = False) -> dict | None:
     """通用 LLM 调用，返回解析后的 JSON 或 None"""
-    if not _llm_config["api_key"]:
+    cfg = _get_llm_config()
+    if not cfg["api_key"]:
         return None
     try:
         from openai import OpenAI
-        client = OpenAI(api_key=_llm_config["api_key"], base_url=_llm_config["base_url"], timeout=15.0)
-        kwargs = dict(model=_llm_config["model"], messages=messages, temperature=0.3)
+        client = OpenAI(api_key=cfg["api_key"], base_url=cfg["base_url"], timeout=15.0)
+        kwargs = dict(model=cfg["model"], messages=messages, temperature=0.3)
         resp = client.chat.completions.create(**kwargs)
         content = resp.choices[0].message.content.strip()
         if expect_json:
@@ -136,6 +147,7 @@ def _build_heuristic_relations() -> list[dict]:
     n = len(papers)
     texts = [p.get("abstract", p.get("full_text", ""))[:3000] for p in papers]
     ids = [p["id"] for p in papers]
+    id_to_idx = {p["id"]: i for i, p in enumerate(papers)}
 
     vectorizer = TfidfVectorizer(max_features=500)
     try:
@@ -187,7 +199,7 @@ def _build_heuristic_relations() -> list[dict]:
             for i, p2 in enumerate(papers):
                 if p2["id"] == pid:
                     continue
-                sim = sim_matrix[ids.index(pid)][ids.index(p2["id"])]
+                sim = sim_matrix[id_to_idx[pid]][id_to_idx[p2["id"]]]
                 if sim > most_sim_val:
                     most_sim_val = sim
                     most_sim_idx = p2["id"]
@@ -273,12 +285,12 @@ def clear_papers():
 def configure_llm():
     data = request.get_json() or {}
     if "api_key" in data:
-        _llm_config["api_key"] = data["api_key"]
+        _get_llm_config()["api_key"] = data["api_key"]
     if "base_url" in data:
-        _llm_config["base_url"] = data["base_url"]
+        _get_llm_config()["base_url"] = data["base_url"]
     if "model" in data:
-        _llm_config["model"] = data["model"]
-    return jsonify({"success": True, "configured": bool(_llm_config["api_key"])})
+        _get_llm_config()["model"] = data["model"]
+    return jsonify({"success": True, "configured": bool(_get_llm_config()["api_key"])})
 
 
 # ---------------- 知识图谱 API ----------------
@@ -292,10 +304,12 @@ def build_graph():
     with _tasks_lock:
         _get_tasks()[task_id] = {"status": "running", "progress": 0, "result": None}
 
+    sid = _session_id()
+
     def _run():
         _get_store().clear_relations()
 
-        has_llm = bool(_llm_config["api_key"])
+        has_llm = bool(_get_llm_config()["api_key"])
         if has_llm:
             papers = _get_store().list_all()
             texts = [p.get("abstract", p.get("full_text", ""))[:3000] for p in papers]
@@ -428,17 +442,29 @@ Return JSON: {{"relation": "...", "confidence": 0.0-1.0, "evidence": "reason"}}"
                     evidence=r["evidence"],
                 ))
 
-        # 聚类：先聚类，再标记完成
+        # 聚类
         try:
             _run_clustering()
-        except Exception as e:
+        except Exception:
             import traceback
             traceback.print_exc()
 
         with _tasks_lock:
             _get_tasks()[task_id] = {"status": "done", "progress": 100, "result": {"relations": _get_store().relation_count, "clusters": len(_get_cluster_meta())}}
 
-    thread = threading.Thread(target=_run)
+    def _run_wrapped():
+        _bg_sid.value = sid
+        try:
+            _run()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            with _tasks_lock:
+                _get_tasks()[task_id] = {"status": "error", "progress": 0, "result": {"error": "图谱构建过程出错，请重试"}}
+        finally:
+            _bg_sid.value = None
+
+    thread = threading.Thread(target=_run_wrapped)
     thread.daemon = True
     thread.start()
 
@@ -455,7 +481,7 @@ CLUSTER_COLORS = [
 
 def _name_clusters_via_llm(clusters_info: list[dict]) -> dict[str, str]:
     """调用 LLM 为每个聚类生成有意义的研究方向名称，返回 {cluster_id: name}"""
-    if not _llm_config["api_key"]:
+    if not _get_llm_config()["api_key"]:
         return {}
 
     prompt_lines = ["以下是从学术论文中通过 KMeans 聚类得到的若干个研究方向分组。",
@@ -814,7 +840,7 @@ def summarize_paper(paper_id):
     data = request.get_json() or {}
     style = data.get("style", "brief")
 
-    if not _llm_config["api_key"]:
+    if not _get_llm_config()["api_key"]:
         return jsonify({"summary": "请先配置 LLM API Key", "key_findings": [], "methodology": "", "limitations": ""})
 
     length_hint = "2-3 sentences" if style == "brief" else "detailed, 3-4 paragraphs"
@@ -851,7 +877,7 @@ def cross_analyze():
     if not paper_ids:
         return jsonify({"analysis": "请选择至少两篇论文"})
 
-    if not _llm_config["api_key"]:
+    if not _get_llm_config()["api_key"]:
         return jsonify({"analysis": "请先配置 LLM API Key", "comparisons": []})
 
     paper_summaries = []
@@ -892,7 +918,7 @@ def detect_gaps():
     if len(discussions) < 3:
         return jsonify({"gaps": [], "message": "包含 Discussion 章节的论文不足 3 篇，无法进行缺口检测"})
 
-    if not _llm_config["api_key"]:
+    if not _get_llm_config()["api_key"]:
         return jsonify({"gaps": [], "message": "请先配置 LLM API Key"})
 
     disc_text = "\n\n".join([f"Paper: {d['title']}\nDiscussion: {d['discussion']}" for d in discussions])
@@ -990,9 +1016,7 @@ def analyze():
         target_word_raw = request.form.get('target_word', '')
         target_words = [w.strip() for w in re.split(r'[\s,，]+', target_word_raw) if w.strip()]
 
-        for tw in target_words:
-            jieba.add_word(tw, tag='n')
-
+        # 不调用 jieba.add_word，避免多用户环境下的全局副作用
         color_scheme = request.form.get('color_scheme', '科技感')
 
         # 2. 分词与词性过滤（带降级策略）
@@ -1029,10 +1053,10 @@ def analyze():
 
         # 4. 专项词分析
         keyword_stats = []
+        total_chars = len(content)
         for kw in target_words:
-            count = words.count(kw)
-            total = len(words)
-            ratio = (count / total * 100) if total > 0 else 0
+            count = content.count(kw)
+            ratio = (count / max(total_chars, 1) * 100)
             wt = tfidf_dict.get(kw, 0)
             wt_ratio = (wt / global_total_weight * 100)
             weight_str = f"{wt:.4f}" if wt > 0 else "0.0000"
@@ -1133,7 +1157,7 @@ def analyze():
                 tree_data["children"].append(cluster_node)
 
         # 9. 构建监测词专属数据
-        valid_targets = [kw for kw in target_words if kw in words]
+        valid_targets = [kw for kw in target_words if kw in content]
 
         monitor_bar_data = {
             'categories': [stat['word'] for stat in keyword_stats],
@@ -1147,6 +1171,9 @@ def analyze():
             if not sentence.strip():
                 continue
             sen_words = [w for w in jieba.lcut(sentence) if w in words]
+            for tw in valid_targets:
+                if tw in sentence and tw not in sen_words:
+                    sen_words.append(tw)
             has_target = any(w in valid_targets for w in sen_words)
             if not has_target:
                 continue
