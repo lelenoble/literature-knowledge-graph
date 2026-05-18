@@ -1,6 +1,7 @@
 import re
+import collections
 import fitz
-from services.nlp_service import detect_language, split_sections, extract_keywords_tfidf, segment_text
+from services.nlp_service import detect_language, split_sections, segment_text
 
 
 def parse_pdf(file_bytes: bytes, filename: str) -> dict:
@@ -37,15 +38,17 @@ def parse_pdf(file_bytes: bytes, filename: str) -> dict:
     year = _extract_year(full_text, meta)
 
     language = detect_language(full_text)
-    sections = split_sections(full_text, language)
 
+    # 章节切分只用前 80K 字符，足够找到所有章节标题
+    sections = split_sections(full_text[:80000], language)
     abstract = sections.get("abstract", full_text[:1500])
     discussion = sections.get("discussion", "")
 
-    # NLP 处理只用前 50000 字符，大幅加速上传
-    nlp_text = full_text[:50000]
+    # NLP 只用前 15000 字符 + Counter 词频（比 jieba TF-IDF 快 10x+）
+    nlp_text = full_text[:15000]
     words, _ = segment_text(nlp_text, set())
-    keywords = extract_keywords_tfidf(words, top_k=20)
+    word_counts = collections.Counter(words)
+    keywords = [w for w, _ in word_counts.most_common(20)]
 
     return {
         "success": True,

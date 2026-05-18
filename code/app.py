@@ -232,17 +232,24 @@ def upload_papers():
 
     files = request.files.getlist('files')
     results = []
+    MAX_SIZE = 50 * 1024 * 1024  # 50MB per file
 
     for file in files:
         if file.filename == '':
             continue
-        raw_bytes = file.read()
-        result = parse_pdf(raw_bytes, file.filename)
-        if result.get("success"):
-            paper_id = _get_store().add(result)
-            results.append({"id": paper_id, "title": result["title"], "status": "success"})
-        else:
-            results.append({"filename": file.filename, "status": "error", "error": result.get("error", "未知错误")})
+        try:
+            raw_bytes = file.read()
+            if len(raw_bytes) > MAX_SIZE:
+                results.append({"filename": file.filename, "status": "error", "error": "文件超过 50MB 限制"})
+                continue
+            result = parse_pdf(raw_bytes, file.filename)
+            if result.get("success"):
+                paper_id = _get_store().add(result)
+                results.append({"id": paper_id, "title": result["title"], "status": "success"})
+            else:
+                results.append({"filename": file.filename, "status": "error", "error": result.get("error", "未知错误")})
+        except Exception as e:
+            results.append({"filename": file.filename, "status": "error", "error": f"处理异常: {str(e)}"})
 
     return jsonify({"papers": results, "total": _get_store().paper_count})
 
